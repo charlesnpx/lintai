@@ -94,7 +94,7 @@ type ruleToolContext struct {
 }
 
 // ruleEntry is owned by the serialized session lifecycle. Bundle texts and the
-// plan template are independent of the request's temporary files and runtimes.
+// compiled plan are independent of the request's temporary files and runtimes.
 type ruleEntry struct {
 	context      ruleToolContext
 	observations observe.Set
@@ -235,13 +235,17 @@ func (catalog *ruleCatalog) prepareArtifact(rule *ruleRecord) (bundle.Artifacts,
 
 // Metadata is read only after the bundle-hash barrier. Partial metadata is
 // retained even on failure for duplicate and inventory checks.
-func (catalog *ruleCatalog) loadMetadata() int {
+func (catalog *ruleCatalog) loadMetadata(retainExecutable bool) int {
 	loaded := 0
 	for _, rule := range catalog.rules {
 		if !rule.bundled || rule.disposition == ruleIntegrityRejected || rule.metadataRead {
 			continue
 		}
-		rule.metadata, rule.isRule, rule.loadError = runtime.ReadRuleMetadata(rule.retained.pureCode)
+		inspection, err := runtime.InspectPureBundle(rule.retained.pureCode)
+		rule.metadata, rule.isRule, rule.loadError = inspection.Metadata, inspection.IsRule, err
+		if retainExecutable {
+			rule.loaded = inspection.Rule
+		}
 		rule.metadataRead = true
 		loaded++
 		switch {
@@ -255,7 +259,13 @@ func (catalog *ruleCatalog) loadMetadata() int {
 }
 
 func (catalog *ruleCatalog) close() {
-	if catalog != nil && catalog.bundleDir != "" {
+	if catalog == nil {
+		return
+	}
+	for _, rule := range catalog.rules {
+		rule.release()
+	}
+	if catalog.bundleDir != "" {
 		_ = os.RemoveAll(catalog.bundleDir)
 		catalog.bundleDir = ""
 	}
@@ -282,7 +292,7 @@ func ListRules(ctx context.Context, options Options) (RuleList, error) {
 	if len(catalog.rules) == 0 {
 		return list, nil
 	}
-	catalog.loadMetadata()
+	catalog.loadMetadata(false)
 	type foundRule struct {
 		ListedRule
 		shapeErr error

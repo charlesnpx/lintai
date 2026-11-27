@@ -320,7 +320,8 @@ func (e *Session) runAndPublish(checkCtx context.Context, options Options, key s
 	if err != nil {
 		return nil, err
 	}
-	published := newPublishedResult(result, options, key, observe.Union(evidence.observations, state.observations), evidence.reusable)
+	reusable := evidence.reusable && !options.SuppressAll && len(options.SuppressRules) == 0 && !options.PruneSuppressions
+	published := newPublishedResult(result, options.WorkspaceRoot, key, observe.Union(evidence.observations, state.observations), reusable)
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
@@ -490,7 +491,7 @@ func (e *Session) analyzeWithEvidence(ctx context.Context, options Options, mode
 	// deliberately sees partial and unapproved IDs before eligibility is set.
 	inventory, integrityComplete := preMetadataIntegrity(ruleCatalog, lock, options.WorkspaceRoot, assembled.snapshotID)
 	run.complete = run.complete && integrityComplete
-	e.stats.gojaRuntimes.Add(int64(ruleCatalog.loadMetadata()))
+	e.stats.gojaRuntimes.Add(int64(ruleCatalog.loadMetadata(true)))
 	integrityComplete = postMetadataIntegrity(ruleCatalog, lock, options.WorkspaceRoot, assembled.snapshotID)
 	run.complete = run.complete && integrityComplete
 	knownRules, loaded := classifyRuleIDs(ruleCatalog, options.WorkspaceRoot, assembled.snapshotID)
@@ -502,7 +503,7 @@ func (e *Session) analyzeWithEvidence(ctx context.Context, options Options, mode
 		return Result{}, run, evidence, err
 	}
 	e.prepareRulePlans(ruleCatalog, producerCatalog, assembled.snapshotID)
-	jobs, requested := ruleRelationDemand(ruleCatalog, producerCatalog)
+	jobs, requested := ruleRelationDemand(ruleCatalog)
 	if len(jobs) > 0 {
 		assembled, err = producerCatalog.collect(ctx, options, requested, e.currentFacts, mode)
 		if err != nil {
