@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
-	"github.com/bigbizze/lintai/backend/typescript"
-	"github.com/bigbizze/lintai/bundle"
 	"github.com/bigbizze/lintai/diagnostics"
 	"github.com/bigbizze/lintai/engine"
 	"github.com/bigbizze/lintai/jsonrpc"
 )
+
+const ProtocolVersion = 3
 
 const (
 	errCodeInvalidRequest = -32600
@@ -24,7 +25,7 @@ const (
 )
 
 type Analyzer interface {
-	Check(ctx context.Context, options ...engine.Options) (engine.Result, error)
+	RefreshAll(ctx context.Context, options engine.Options) (engine.FilesResult, error)
 	RefreshFiles(ctx context.Context, options engine.Options, files []string) (engine.FilesResult, error)
 	Close() error
 }
@@ -42,37 +43,16 @@ type Server struct {
 }
 
 type InitializeParams struct {
-	RepoRoot             string            `json:"repoRoot"`
-	AssetRoot            string            `json:"assetRoot"`
-	WorkspaceRoot        string            `json:"workspaceRoot"`
-	RuleGlobs            []string          `json:"ruleGlobs"`
-	Excludes             []string          `json:"excludes,omitempty"`
-	Files                string            `json:"files,omitempty"`
-	SourceLinks          string            `json:"sourceLinks,omitempty"`
-	Env                  map[string]any    `json:"env"`
-	FactLimit            int               `json:"factLimit,omitempty"`
-	RuleWorkers          int               `json:"ruleWorkers,omitempty"`
-	Severity             map[string]string `json:"severity,omitempty"`
-	RulesLock            string            `json:"rulesLock,omitempty"`
-	SetupSandbox         string            `json:"setupSandbox,omitempty"`
-	SuppressionsLocation string            `json:"suppressionsLocation,omitempty"`
+	ProtocolVersion      int    `json:"protocolVersion"`
+	WorkspaceRoot        string `json:"workspaceRoot"`
+	FactLimit            int    `json:"factLimit,omitempty"`
+	RuleWorkers          int    `json:"ruleWorkers,omitempty"`
+	RulesLock            string `json:"rulesLock,omitempty"`
+	SuppressionsLocation string `json:"suppressionsLocation,omitempty"`
 }
 
-type FilesDiagnosticsParams struct {
-	Files []string `json:"files"`
-}
-type ReanalyzeParams struct {
-	Reason      string `json:"reason,omitempty"`
-	RuleWorkers *int   `json:"ruleWorkers,omitempty"`
-}
 type InitializeResult struct {
 	ProtocolVersion int `json:"protocolVersion"`
-}
-type AnalysisResult struct {
-	SnapshotVersion string   `json:"snapshotVersion"`
-	RulesLoaded     int      `json:"rulesLoaded"`
-	DiagnosticCount int      `json:"diagnosticCount"`
-	Problems        []string `json:"problems"`
 }
 
 // FilesDiagnosticsResult preserves the order and duplicates in the request.
@@ -83,8 +63,9 @@ type FilesDiagnosticsResult struct {
 	Problems        []string          `json:"problems"`
 }
 type FileDiagnostics struct {
-	File        string                   `json:"file"`
-	Diagnostics []diagnostics.Diagnostic `json:"diagnostics"`
+	SourceDigest string                   `json:"sourceDigest"`
+	File         string                   `json:"file"`
+	Diagnostics  []diagnostics.Diagnostic `json:"diagnostics"`
 }
 
 func NewWithFactory(factory AnalyzerFactory) *Server { return &Server{factory: factory} }
@@ -133,8 +114,6 @@ func (s *Server) handleRequest(ctx context.Context, request jsonrpc.Request) (js
 		response.Result, err = s.handleInitialize(request.Params)
 	case "diagnostics/files":
 		response.Result, err = s.handleFilesDiagnostics(ctx, request.Params)
-	case "reanalyze":
-		response.Result, err = s.handleReanalyze(ctx, request.Params)
 	case "shutdown":
 		response.Result = map[string]any{}
 		return response, true
@@ -157,99 +136,91 @@ func (s *Server) handleInitialize(rawParams json.RawMessage) (InitializeResult, 
 	if params.RuleWorkers < 0 {
 		return InitializeResult{}, invalidParams("rule workers must be zero or a positive integer")
 	}
-	if _, err := typescript.ParseFileScope(params.Files); err != nil {
-		return InitializeResult{}, invalidParams(err.Error())
-	}
-	if params.Env == nil {
-		params.Env = map[string]any{}
-	}
-	ruleSeverity := make(map[string]diagnostics.Severity, len(params.Severity))
-	for ruleID, level := range params.Severity {
-		severity, err := diagnostics.ParseSeverity(level)
-		if err != nil {
-			return InitializeResult{}, invalidParams(fmt.Sprintf("severity of rule %q: %v", ruleID, err))
-		}
-		ruleSeverity[ruleID] = severity
-	}
-	sandbox, err := bundle.ParseSetupSandbox(params.SetupSandbox)
-	if err != nil {
-		return InitializeResult{}, invalidParams(err.Error())
+	if params.ProtocolVersion != ProtocolVersion {
+		return InitializeResult{}, invalidParams(fmt.Sprintf("incompatible lintai serve protocol version: server requires %d, client sent %d", ProtocolVersion, params.ProtocolVersion))
 	}
 	options := engine.Options{
-		RepoRoot: params.RepoRoot, AssetRoot: params.AssetRoot, WorkspaceRoot: params.WorkspaceRoot,
-		RuleGlobs: append([]string(nil), params.RuleGlobs...), Env: params.Env,
-		Severity: diagnostics.SeverityError, RuleSeverity: ruleSeverity, FactLimit: params.FactLimit,
-		RuleWorkers: params.RuleWorkers, RulesLock: params.RulesLock, SetupSandbox: sandbox,
+		RepoRoot: params.WorkspaceRoot, WorkspaceRoot: params.WorkspaceRoot,
+		FactLimit: params.FactLimit, RuleWorkers: params.RuleWorkers, RulesLock: params.RulesLock,
 		SuppressionsLocation: params.SuppressionsLocation,
 	}
-	if s.factory != nil {
-		if s.engine != nil {
-			_ = s.engine.Close()
-		}
-		s.engine = s.factory(params)
+	if s.factory == nil {
+		return InitializeResult{}, fmt.Errorf("missing analyzer factory")
 	}
+	analyzer := s.factory(params)
+	if analyzer == nil {
+		return InitializeResult{}, fmt.Errorf("analyzer factory returned nil")
+	}
+	if s.engine != nil {
+		_ = s.engine.Close()
+	}
+	s.engine = analyzer
 	s.options, s.initialized = options, true
-	return InitializeResult{ProtocolVersion: 2}, nil
+	return InitializeResult{ProtocolVersion: ProtocolVersion}, nil
 }
 
 func (s *Server) handleFilesDiagnostics(ctx context.Context, rawParams json.RawMessage) (FilesDiagnosticsResult, error) {
 	if !s.initialized {
 		return FilesDiagnosticsResult{}, fmt.Errorf("server not initialized")
 	}
-	var params FilesDiagnosticsParams
+	var params struct {
+		Files json.RawMessage `json:"files"`
+	}
 	if err := decodeParams(rawParams, &params); err != nil {
 		return FilesDiagnosticsResult{}, err
 	}
-	if params.Files == nil {
-		return FilesDiagnosticsResult{}, invalidParams("files array is required")
-	}
-	for _, file := range params.Files {
-		if strings.TrimSpace(file) == "" {
-			return FilesDiagnosticsResult{}, invalidParams("each file is required")
+	var names []string
+	var selector string
+	all := json.Unmarshal(params.Files, &selector) == nil && selector == "all"
+	var result engine.FilesResult
+	var err error
+	if all {
+		result, err = s.engine.RefreshAll(ctx, s.options)
+	} else {
+		if json.Unmarshal(params.Files, &names) != nil || names == nil {
+			return FilesDiagnosticsResult{}, invalidParams(`files must be an array of names or "all"`)
 		}
+		for _, name := range names {
+			if strings.TrimSpace(name) == "" {
+				return FilesDiagnosticsResult{}, invalidParams("each file is required")
+			}
+		}
+		result, err = s.engine.RefreshFiles(ctx, s.options, slices.Clone(names))
 	}
-	result, err := s.engine.RefreshFiles(ctx, s.options, params.Files)
 	if err != nil {
 		return FilesDiagnosticsResult{}, err
 	}
-	s.logWarnings(result.Warnings)
-	files := make([]FileDiagnostics, len(params.Files))
-	for i, name := range params.Files {
-		files[i] = FileDiagnostics{File: name, Diagnostics: append([]diagnostics.Diagnostic{}, result.Diagnostics[i]...)}
+	if len(result.Diagnostics) != len(result.Files) || len(result.SourceDigests) != len(result.Files) || (!all && !slices.Equal(names, result.Files)) {
+		return FilesDiagnosticsResult{}, fmt.Errorf("analyzer returned inconsistent file groups for diagnostics/files")
 	}
+	seen := make(map[string]bool)
+	files := make([]FileDiagnostics, len(result.Files))
+	for i, name := range result.Files {
+		if all {
+			if strings.TrimSpace(name) == "" || seen[name] {
+				return FilesDiagnosticsResult{}, fmt.Errorf("analyzer returned invalid file name %q for all files", name)
+			}
+			seen[name] = true
+		}
+		items := result.Diagnostics[i]
+		if items == nil {
+			items = []diagnostics.Diagnostic{}
+		}
+		files[i] = FileDiagnostics{File: name, SourceDigest: result.SourceDigests[i], Diagnostics: items}
+	}
+	s.logWarnings(result.Warnings)
 	return FilesDiagnosticsResult{SnapshotVersion: result.SnapshotVersion, RulesLoaded: result.RulesLoaded,
 		Files: files, Problems: problemStrings(result.WorkspaceProblems)}, nil
-}
-
-func (s *Server) handleReanalyze(ctx context.Context, rawParams json.RawMessage) (AnalysisResult, error) {
-	if !s.initialized {
-		return AnalysisResult{}, fmt.Errorf("server not initialized")
-	}
-	var params ReanalyzeParams
-	if len(rawParams) > 0 {
-		if err := decodeParams(rawParams, &params); err != nil {
-			return AnalysisResult{}, err
-		}
-	}
-	options := s.options
-	if params.RuleWorkers != nil {
-		if *params.RuleWorkers < 0 {
-			return AnalysisResult{}, invalidParams("rule workers must be zero or a positive integer")
-		}
-		options.RuleWorkers = *params.RuleWorkers
-	}
-	result, err := s.engine.Check(ctx, options)
-	if err != nil {
-		return AnalysisResult{}, err
-	}
-	s.logWarnings(result.Warnings)
-	return AnalysisResult{SnapshotVersion: result.SnapshotVersion, RulesLoaded: result.RulesLoaded, DiagnosticCount: len(result.Diagnostics), Problems: problemStrings(result.Diagnostics)}, nil
 }
 
 func problemStrings(items []diagnostics.Diagnostic) []string {
 	problems := []string{}
 	for _, item := range items {
-		if item.SourceLocation != nil || item.DiagnosticKind != diagnostics.KindRuleExecutionError {
+		if item.SourceLocation != nil {
+			continue
+		}
+		if item.DiagnosticKind != diagnostics.KindRuleExecutionError {
+			problems = append(problems, fmt.Sprintf("[%s/%s] %s", item.RuleID, item.AssertionID, item.Message))
 			continue
 		}
 		phase := ""

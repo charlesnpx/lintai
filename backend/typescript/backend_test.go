@@ -3,6 +3,7 @@ package typescript
 import (
 	"context"
 	"fmt"
+
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +15,7 @@ import (
 	"github.com/bigbizze/lintai/engine"
 	"github.com/bigbizze/lintai/facts"
 	"github.com/bigbizze/lintai/internal/ambient"
+	"github.com/bigbizze/lintai/internal/testpack"
 	"github.com/bigbizze/lintai/internal/tsgo/lintaiapi"
 	"github.com/bigbizze/lintai/internal/workspace"
 	"github.com/bigbizze/lintai/observe"
@@ -608,11 +610,13 @@ export default rule("test.filtered-callback").version(1)
     indeterminate(Fn, Name) :- ts.fn(Fn, _, Name), Name = "escape", ts.site_owner(Site, Fn), ts.fn_value_escape_unknown(Site).`+"`"+`)
   .report("indeterminate").message((row) => row.Name);
 `)
-	session := engine.Open(engine.Options{}, New())
+	session, err := engine.Open(engine.Options{}, New())
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer session.Close()
 	result, err := session.Check(context.Background(), engine.Options{
-		RepoRoot: repoRoot, AssetRoot: filepath.Join(repoRoot, "packages/client"), WorkspaceRoot: root,
-		RuleGlobs: []string{"lintai-rules/*.ts"},
+		RepoRoot: repoRoot, WorkspaceRoot: testpack.Build(t, repoRoot, root, "lintai-rules/*.ts"),
 	})
 	if err != nil {
 		t.Fatal(err)

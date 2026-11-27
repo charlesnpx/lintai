@@ -1,6 +1,12 @@
 package engine
 
 import (
+	"context"
+	"github.com/bigbizze/lintai/backend"
+	"github.com/bigbizze/lintai/observe"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -175,5 +181,201 @@ func TestProducerAnchorTrackingIsExplicitAndConflictsAreRejected(t *testing.T) {
 				t.Fatalf("expected anchor validation failure containing %q, got %v", item.message, err)
 			}
 		})
+	}
+}
+
+func TestBoundProducerOwnershipAndConfigurationIdentity(t *testing.T) {
+	valid := newParallelFixtureProducer()
+	invalid := newParallelFixtureProducer()
+	invalid.description.Namespace = "invalid-namespace"
+	if session, err := Open(Options{}, valid, invalid); err == nil || session != nil || valid.closed.Load() || invalid.closed.Load() {
+		t.Fatal("failed Open took ownership of supplied producers")
+	}
+	snapshots := make(map[string]string)
+	for _, tc := range []struct {
+		kind  string
+		shape any
+	}{
+		{"null", []any(nil)}, {"null", map[string]any(nil)}, {"array", []any{}}, {"object", map[string]any{}},
+	} {
+		valid.description.EffectiveConfiguration = map[string]any{"shape": []any{tc.shape}}
+		session, err := Open(Options{}, valid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delete(valid.description.EffectiveConfiguration.(map[string]any), "shape")
+		facts, err := session.catalog.collect(context.Background(), Options{}, nil, nil, observe.Full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if previous, exists := snapshots[facts.snapshotID]; exists && previous != tc.kind {
+			t.Fatalf("configuration shapes collapsed: %s and %s", previous, tc.kind)
+		}
+		snapshots[facts.snapshotID] = tc.kind
+		if err := session.Close(); err != nil || !valid.closed.Load() {
+			t.Fatalf("closing owned producer: %v", err)
+		}
+		valid = newParallelFixtureProducer()
+	}
+	if len(snapshots) != 3 {
+		t.Fatalf("null/array/object identity: %v", snapshots)
+	}
+}
+
+func TestSourceIdentityUsesDiagnosticFileMapping(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "item.ts")
+	inside := filepath.Join(root, "item.ts")
+	relative := strings.TrimLeft(filepath.ToSlash(outside), "/")
+	if volume := filepath.VolumeName(outside); volume != "" {
+		relative = strings.TrimLeft(strings.TrimPrefix(filepath.ToSlash(outside), volume), "/")
+	}
+	a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	metadata := backend.GenerationMetadata{InputRevision: "1", SourceDigests: map[string]string{inside: a, outside: b}}
+	digests := make(map[string]string)
+	if _, err := captureGenerationMetadata(metadata, fileKeys{root: root, physical: root}, "p", digests, map[string]map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	metadata.SourceDigests[inside] = b
+	diag := func(file string) diagnostics.Diagnostic {
+		return diagnostics.Diagnostic{SourceLocation: &diagnostics.SourceLocation{File: file}, Message: file}
+	}
+	result := Result{files: fileKeys{root: root, physical: root}, AnalyzedFiles: []string{"item.ts", "no-findings.ts"}, Diagnostics: []diagnostics.Diagnostic{diag(inside), diag(filepath.ToSlash(outside))}}
+	p := newPublishedResult(result, digests, "", observe.Set{}, true)
+	files := []string{"./item.ts", outside, relative, inside}
+	projected := p.projectFiles(files, false)
+	if !slices.Equal(projected.Files, files) || !slices.Equal(projected.SourceDigests, []string{a, b, "", a}) || len(projected.Diagnostics[2]) != 0 {
+		t.Fatalf("projected: %+v", projected)
+	}
+	for i, file := range files {
+		if !slices.EqualFunc(result.DiagnosticsFor(file), projected.Diagnostics[i], func(a, b diagnostics.Diagnostic) bool { return a.Message == b.Message }) {
+			t.Fatalf("inconsistent grouping for %s", file)
+		}
+	}
+	if len(p.projectFiles(nil, true).Files) != 3 {
+		t.Fatal("all must include analyzed and diagnostic-bearing groups")
+	}
+	if _, err := captureGenerationMetadata(metadata, fileKeys{root: root, physical: root}, "p", digests, map[string]map[string]struct{}{}); err == nil {
+		t.Fatal("conflicting identity accepted")
+	}
+}
+
+func TestSourceDigestRequiresRangeOwner(t *testing.T) {
+	root := t.TempDir()
+	digests, owners := map[string]string{}, map[string]map[string]struct{}{}
+	current := strings.Repeat("c", 64)
+	if _, err := captureGenerationMetadata(backend.GenerationMetadata{InputRevision: "1", SourceDigests: map[string]string{"a.ts": current}}, fileKeys{root: root, physical: root}, "b", digests, owners); err != nil {
+		t.Fatal(err)
+	}
+	finding := func(anchor string) diagnostics.Diagnostic {
+		return diagnostics.Diagnostic{SourceLocation: &diagnostics.SourceLocation{File: "a.ts", StartLine: 2}, EntityIdentity: &diagnostics.EntityIdentity{SemanticKey: anchor}}
+	}
+	result := Result{files: fileKeys{root: root, physical: root}}
+	evidence := &executionEvidence{sourceDigests: digests, digestOwners: owners, anchorOwners: map[string]string{"a:x": "a", "b:x": "b"}}
+	result.Diagnostics = []diagnostics.Diagnostic{finding("b:x")}
+	if got := verifiedSourceDigests(result, evidence)["a.ts"]; got != current {
+		t.Fatalf("owner-captured digest dropped: %q", got)
+	}
+	result.Diagnostics = append(result.Diagnostics, finding("a:x"))
+	if got, ok := verifiedSourceDigests(result, evidence)["a.ts"]; ok {
+		t.Fatalf("range from producer without a capture was verified by another producer's digest %q", got)
+	}
+}
+
+func TestFileKeysAcceptEverySourceSpelling(t *testing.T) {
+	physical := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(physical, link); err != nil {
+		t.Skip(err)
+	}
+	keys := newFileKeys(link, map[string]string{"alias/a.js": "src/a.js"})
+	for _, spelling := range []string{"src/a.js", "alias/a.js", filepath.Join(link, "src", "a.js"), filepath.Join(link, "alias", "a.js")} {
+		if got := keys.key(spelling); got != "src/a.js" {
+			t.Fatalf("%s -> %s", spelling, got)
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(physical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keys.key(filepath.Join(resolved, "src", "a.js")); got != "src/a.js" {
+		t.Fatalf("physical spelling -> %s", got)
+	}
+}
+
+func TestSourceDigestUsesOneFileKeyForEverySpelling(t *testing.T) {
+	root := t.TempDir()
+	keys := fileKeys{root: root, physical: root, aliases: map[string]string{"alias/a.ts": "src/a.ts"}}
+	old, current := strings.Repeat("a", 64), strings.Repeat("c", 64)
+	digests, owners := map[string]string{}, map[string]map[string]struct{}{}
+	if _, err := captureGenerationMetadata(backend.GenerationMetadata{InputRevision: "1", SourceDigests: map[string]string{"alias/a.ts": old, "src/a.ts": current}}, keys, "p", digests, owners); err == nil {
+		t.Fatal("two captures of one file were accepted")
+	}
+	digests, owners = map[string]string{}, map[string]map[string]struct{}{}
+	if _, err := captureGenerationMetadata(backend.GenerationMetadata{InputRevision: "1", SourceDigests: map[string]string{"alias/a.ts": current}}, keys, "p", digests, owners); err != nil {
+		t.Fatal(err)
+	}
+	result := Result{files: keys, Diagnostics: []diagnostics.Diagnostic{{SourceLocation: &diagnostics.SourceLocation{File: "src/a.ts", StartLine: 1}, EntityIdentity: &diagnostics.EntityIdentity{SemanticKey: "p:x"}}}}
+	evidence := &executionEvidence{sourceDigests: digests, digestOwners: owners, anchorOwners: map[string]string{"p:x": "p"}}
+	if got := verifiedSourceDigests(result, evidence)["src/a.ts"]; got != current {
+		t.Fatalf("alias-supplied digest not verified for its canonical file: %q", got)
+	}
+}
+
+func TestOperationFileKeysUseTheProducersRootResolution(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		if err := os.Mkdir(filepath.Join(parent, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(parent, "current")
+	if err := os.Symlink(filepath.Join(parent, "a"), link); err != nil {
+		t.Skip(err)
+	}
+	read, err := filepath.EvalSymlinks(filepath.Join(parent, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := observe.New([]observe.Record{{Kind: observe.Resolved, Path: link, Value: observe.Value(read)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := newFileKeys(link, nil)
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(parent, "b"), link); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := operationFileKeys(initial, []observe.Set{observed}, func(set observe.Set) observe.Set { return set })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keys.key(filepath.Join(read, "x.ts")); got != "x.ts" {
+		t.Fatalf("file the producer read -> %s", got)
+	}
+	moved, err := filepath.EvalSymlinks(filepath.Join(parent, "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keys.key(filepath.Join(moved, "x.ts")); got == "x.ts" {
+		t.Fatal("file in the newly linked workspace matched the published result")
+	}
+	other, err := observe.New([]observe.Record{{Kind: observe.Resolved, Path: link, Value: observe.Value(moved)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := operationFileKeys(initial, []observe.Set{observed, other}, func(set observe.Set) observe.Set { return set }); err == nil {
+		t.Fatal("producers that read different workspaces were composed")
+	}
+}
+
+func TestProjectAllOmitsIdentityAliases(t *testing.T) {
+	root := t.TempDir()
+	result := Result{files: fileKeys{root: root, physical: root, aliases: map[string]string{"a.ts": "a.ts"}}, AnalyzedFiles: []string{"a.ts"}}
+	projected := newPublishedResult(result, nil, "", observe.Set{}, true).projectFiles(nil, true)
+	if !slices.Equal(projected.Files, []string{"a.ts"}) {
+		t.Fatalf("files: %v", projected.Files)
 	}
 }
