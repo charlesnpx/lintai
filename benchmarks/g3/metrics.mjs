@@ -21,8 +21,7 @@ export function summary(samples) {
 	};
 }
 
-// Release and counted runs have separate files. A cold capture has no previous
-// config receipt or workspace publication to validate.
+// Release and counted runs have separate files.
 export function record(event, metrics, expected) {
 	const row = { event, ...metrics, load_avg_before: loadBefore, load_avg_after: os.loadavg() };
 	if (trace) {
@@ -33,15 +32,10 @@ export function record(event, metrics, expected) {
 			values.get(key).push(Number(value));
 		}
 		const get = (key) => values.get(key) ?? [];
-		const requests = get("rpc.diagnostics/files").length;
-		const workspace = get("workspace.ns");
-		const config = get("config.ns");
+		const all = get("rpc.diagnostics/workspace").length;
 		const counts = {
-			requests,
-			config: config.length,
-			workspace: workspace.length,
-			analyses: get("analysis").length,
-			all: get("selector.all").length,
+			requests: all + get("rpc.diagnostics/document").length,
+			all,
 			adapter_source_reads: get("source.read").length,
 		};
 		const totals = (prefix) =>
@@ -52,40 +46,13 @@ export function record(event, metrics, expected) {
 			);
 		Object.assign(row, {
 			rpc_methods: totals("rpc."),
-			binary_commands: totals("binary."),
 			counts,
-			selector_lengths: [...new Set(get("selector.files"))],
 			largest_frame_bytes: Math.max(0, ...get("frame.bytes")),
-			observations: Object.fromEntries(
-				[...values]
-					.filter(([k]) => k.startsWith("observations."))
-					.map(([k, v]) => [k.slice("observations.".length), v[0]]),
-			),
 		});
-		if (event === "singleton-warm") {
-			row.workspace_validation = summary(workspace.map((ns) => ns / 1e6));
-			row.config_validation = summary(config.map((ns) => ns / 1e6));
-		}
-		if (requests && !counts.all) {
-			const sizes = {
-				"all-projections-warm": 511,
-				"batch-cold": 477,
-				"batch-warm": 477,
-				"empty-batch-warm": 0,
-			};
-			const n = sizes[event] ?? 1;
-			assert.deepEqual(row.selector_lengths, [n], `${event} selector`);
-		}
+		if (event.startsWith("singleton"))
+			assert.ok(row.largest_frame_bytes < 4096, `${event} response: ${row.largest_frame_bytes}`);
 		for (const [key, value] of Object.entries(expected ?? {})) {
 			assert.equal(counts[key], value, `${event} ${key}: ${JSON.stringify(counts)}`);
-		}
-		if (event.endsWith("-cli-cold") && counts.all)
-			assert.deepEqual(row.binary_commands, { serve: 1 });
-		if (metrics.findings === 10074 && requests === 1) {
-			assert.ok(
-				row.largest_frame_bytes > 2 * 1024 ** 2,
-				"expected a multi-megabyte framed response",
-			);
 		}
 	}
 	const json = JSON.stringify(row);

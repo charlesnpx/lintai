@@ -5,12 +5,12 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { record, reset, saveRows } from "./metrics.mjs";
 import { engineRow, names } from "./semantic.mjs";
-import { installed, parent, root, rules, versions } from "./settings.mjs";
+import { binary, root, versions } from "./settings.mjs";
 
 function run(args, status) {
 	reset();
 	const start = performance.now();
-	const result = spawnSync(process.env.G3_BINARY, args, {
+	const result = spawnSync(binary, args, {
 		cwd: root,
 		encoding: "utf8",
 		maxBuffer: 64 << 20,
@@ -24,7 +24,7 @@ function run(args, status) {
 
 reset();
 record("tools", versions());
-if (!parent) {
+{
 	const { ms } = run(["build-rules"], 0);
 	const pack = readFileSync(path.join(root, ".lintai/rules.json"));
 	record(
@@ -34,21 +34,10 @@ if (!parent) {
 			pack_bytes: pack.length,
 			pack_sha256: createHash("sha256").update(pack).digest("hex"),
 		},
-		{ requests: 0, config: 0, workspace: 0, analyses: 0 },
+		{ requests: 0 },
 	);
 }
 const args = ["check", "--json", "--rule-workers", "1"];
-if (parent)
-	args.push(
-		"--repo-root",
-		process.env.G3_REPO,
-		"--asset-root",
-		path.dirname(installed.resolve("@lintai/client/package.json")),
-		"--rules",
-		rules.join(","),
-		"--files",
-		"tsconfig",
-	);
 const { stdout, ms } = run(args, 1);
 const rows = JSON.parse(stdout).map(engineRow);
 assert.equal(rows.length, 10214);
@@ -64,5 +53,5 @@ record(
 		diagnostics: rows.length,
 		stdout_bytes: Buffer.byteLength(stdout),
 	},
-	{ requests: 0, config: 0, workspace: 0, analyses: 1 },
+	{ requests: 0 },
 );

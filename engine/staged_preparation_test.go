@@ -28,11 +28,18 @@ func TestMixedRuleOutcomes(t *testing.T) {
 	}
 	options := parallelFixtureOptions(t, repoRoot, workspace)
 	options.Rule = map[string]RulePolicy{"fixture.disabled": {Severity: "off"}}
-	session := openTestSession(t, Options{}, newParallelFixtureProducer())
-	defer session.Close()
-	result, err := session.Check(context.Background(), options)
+	session := openTestSession(t, options, newParallelFixtureProducer())
+	result, err := session.Check(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if result.FactRevision == "" {
+		t.Fatal("analysis has no snapshot identity")
+	}
+	for _, item := range result.Diagnostics {
+		if item.Provenance.FactRevision != result.FactRevision || len(item.Provenance.ProducerNamespaces) != 1 || item.Provenance.ProducerNamespaces[0] != "catalog" {
+			t.Errorf("diagnostic did not receive final analysis provenance: %+v", item)
+		}
 	}
 	data, err := json.Marshal(result.Diagnostics)
 	if err != nil {
@@ -45,7 +52,7 @@ func TestMixedRuleOutcomes(t *testing.T) {
 	for _, item := range items {
 		// Generated bundle coordinates can change when the SDK is rebuilt.
 		item["message"], _, _ = strings.Cut(item["message"].(string), " at ")
-		delete(item["provenance"].(map[string]any), "snapshot_version")
+		delete(item["provenance"].(map[string]any), "fact_revision")
 	}
 	got, err := json.MarshalIndent(items, "", "  ")
 	if err != nil {
@@ -58,5 +65,25 @@ func TestMixedRuleOutcomes(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("ordered diagnostics changed:\n--- got\n%s\n--- want\n%s", got, want)
+	}
+}
+
+func TestSuppressedFindingsRetainFinalProvenance(t *testing.T) {
+	repoRoot, _ := filepath.Abs("..")
+	workspace := t.TempDir()
+	program := "Decl violation(Entity, Code). violation(Entity, Code) :- catalog.usable(Entity, Code)."
+	writeTestFile(t, workspace, "lintai-rules/rule.ts", parallelRuleSource("fixture.suppressed", program, "(row) => row.Code"))
+	session := openTestSession(t, parallelFixtureOptions(t, repoRoot, workspace), newParallelFixtureProducer())
+	result, err := session.UpdateSuppressions(context.Background(), SuppressionUpdate{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.SuppressionsWritten || len(result.Suppressed) != 3 {
+		t.Fatalf("expected three recorded and suppressed findings: %+v", result)
+	}
+	for _, item := range result.Suppressed {
+		if item.Provenance.FactRevision != result.FactRevision || item.Provenance.RuleVersion != 1 || len(item.Provenance.ProducerNamespaces) != 1 || item.Provenance.ProducerNamespaces[0] != "catalog" {
+			t.Errorf("suppressed copy lost final analysis provenance: %+v", item)
+		}
 	}
 }

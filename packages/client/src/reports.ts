@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
-import type { Diagnostic } from "./client.js";
+import type { Finding } from "./client.js";
 
 export const mismatchMessage =
 	"[lintai] This source does not match the analyzed text. Save the file and rerun lintai to update its diagnostics.";
+
+export const workspaceChangedMessage =
+	"[lintai] The workspace directory changed while lintai analyzed this file. Rerun lintai to update its diagnostics.";
 
 export function sourceDigest(source: { text: string; hasBOM: boolean }): string {
 	// Both hosts expose the stripped text and a separate BOM flag. Stripping
@@ -22,15 +25,15 @@ export const programLocation = {
 	end: { line: 1, column: 0 },
 };
 
-export function toReport(diagnostic: Diagnostic): Report {
-	const location = diagnostic.source_location;
+export function toReport(finding: Readonly<Finding>): Report {
+	const range = finding.range;
 	return {
-		loc: location
+		loc: range
 			? {
-					start: { line: location.startLine, column: location.startColumn - 1 },
-					end: { line: location.endLine, column: location.endColumn - 1 },
+					start: { line: range[0], column: range[1] - 1 },
+					end: { line: range[2], column: range[3] - 1 },
 				}
 			: programLocation,
-		message: `[${diagnostic.rule_id}/${diagnostic.assertion_id}] ${diagnostic.message}`,
+		message: `[${finding.ruleId}/${finding.assertionId}] ${finding.message}`,
 	};
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 
 	"github.com/bigbizze/lintai/diagnostics"
@@ -14,7 +13,7 @@ import (
 	"github.com/bigbizze/lintai/jsonrpc"
 )
 
-const ProtocolVersion = 3
+const ProtocolVersion = 5
 
 const (
 	errCodeInvalidRequest = -32600
@@ -24,9 +23,11 @@ const (
 	errCodeAnalysis       = -32010
 )
 
+// Analyzer serves the session's workspace. RefreshFile returns the group of
+// one document as the first file of its result.
 type Analyzer interface {
-	RefreshAll(ctx context.Context, options engine.Options) (engine.FilesResult, error)
-	RefreshFiles(ctx context.Context, options engine.Options, files []string) (engine.FilesResult, error)
+	RefreshAll(ctx context.Context) (engine.FilesResult, error)
+	RefreshFile(ctx context.Context, file string) (engine.FilesResult, error)
 	Close() error
 }
 
@@ -35,7 +36,6 @@ type AnalyzerFactory func(InitializeParams) Analyzer
 type Server struct {
 	engine      Analyzer
 	factory     AnalyzerFactory
-	options     engine.Options
 	initialized bool
 	// Log receives each analysis warning once. Nil discards them.
 	Log    io.Writer
@@ -55,17 +55,37 @@ type InitializeResult struct {
 	ProtocolVersion int `json:"protocolVersion"`
 }
 
-// FilesDiagnosticsResult preserves the order and duplicates in the request.
-type FilesDiagnosticsResult struct {
-	SnapshotVersion string            `json:"snapshotVersion"`
-	RulesLoaded     int               `json:"rulesLoaded"`
-	Files           []FileDiagnostics `json:"files"`
-	Problems        []string          `json:"problems"`
+// WorkspaceResult holds every document of one analysis. A file is named
+// relative to PhysicalRoot inside it and by its absolute path outside it.
+type WorkspaceResult struct {
+	Problems     []string       `json:"problems"`
+	PhysicalRoot string         `json:"physicalRoot"`
+	Files        []FileFindings `json:"files"`
 }
-type FileDiagnostics struct {
-	SourceDigest string                   `json:"sourceDigest"`
-	File         string                   `json:"file"`
-	Diagnostics  []diagnostics.Diagnostic `json:"diagnostics"`
+
+// DocumentResult holds one document of an analysis, its workspace problems and
+// the physical root of the workspace the analysis used.
+type DocumentResult struct {
+	Problems     []string  `json:"problems"`
+	PhysicalRoot string    `json:"physicalRoot"`
+	SourceDigest string    `json:"sourceDigest"`
+	Findings     []Finding `json:"findings"`
+}
+
+type FileFindings struct {
+	File         string    `json:"file"`
+	SourceDigest string    `json:"sourceDigest"`
+	Findings     []Finding `json:"findings"`
+}
+
+// Finding is the display form of a located or file-level diagnostic. Range is
+// [startLine, startColumn, endLine, endColumn] in one-based UTF-16 positions.
+type Finding struct {
+	RuleID      string  `json:"ruleId"`
+	AssertionID string  `json:"assertionId"`
+	Severity    string  `json:"severity"`
+	Message     string  `json:"message"`
+	Range       *[4]int `json:"range,omitempty"`
 }
 
 func NewWithFactory(factory AnalyzerFactory) *Server { return &Server{factory: factory} }
@@ -112,8 +132,10 @@ func (s *Server) handleRequest(ctx context.Context, request jsonrpc.Request) (js
 	switch request.Method {
 	case "initialize":
 		response.Result, err = s.handleInitialize(request.Params)
-	case "diagnostics/files":
-		response.Result, err = s.handleFilesDiagnostics(ctx, request.Params)
+	case "diagnostics/workspace":
+		response.Result, err = s.handleWorkspace(ctx, request.Params)
+	case "diagnostics/document":
+		response.Result, err = s.handleDocument(ctx, request.Params)
 	case "shutdown":
 		response.Result = map[string]any{}
 		return response, true
@@ -139,11 +161,6 @@ func (s *Server) handleInitialize(rawParams json.RawMessage) (InitializeResult, 
 	if params.ProtocolVersion != ProtocolVersion {
 		return InitializeResult{}, invalidParams(fmt.Sprintf("incompatible lintai serve protocol version: server requires %d, client sent %d", ProtocolVersion, params.ProtocolVersion))
 	}
-	options := engine.Options{
-		RepoRoot: params.WorkspaceRoot, WorkspaceRoot: params.WorkspaceRoot,
-		FactLimit: params.FactLimit, RuleWorkers: params.RuleWorkers, RulesLock: params.RulesLock,
-		SuppressionsLocation: params.SuppressionsLocation,
-	}
 	if s.factory == nil {
 		return InitializeResult{}, fmt.Errorf("missing analyzer factory")
 	}
@@ -155,62 +172,68 @@ func (s *Server) handleInitialize(rawParams json.RawMessage) (InitializeResult, 
 		_ = s.engine.Close()
 	}
 	s.engine = analyzer
-	s.options, s.initialized = options, true
+	s.initialized = true
 	return InitializeResult{ProtocolVersion: ProtocolVersion}, nil
 }
 
-func (s *Server) handleFilesDiagnostics(ctx context.Context, rawParams json.RawMessage) (FilesDiagnosticsResult, error) {
+func (s *Server) handleWorkspace(ctx context.Context, rawParams json.RawMessage) (WorkspaceResult, error) {
 	if !s.initialized {
-		return FilesDiagnosticsResult{}, fmt.Errorf("server not initialized")
+		return WorkspaceResult{}, fmt.Errorf("server not initialized")
 	}
-	var params struct {
-		Files json.RawMessage `json:"files"`
-	}
+	var params struct{}
 	if err := decodeParams(rawParams, &params); err != nil {
-		return FilesDiagnosticsResult{}, err
+		return WorkspaceResult{}, err
 	}
-	var names []string
-	var selector string
-	all := json.Unmarshal(params.Files, &selector) == nil && selector == "all"
-	var result engine.FilesResult
-	var err error
-	if all {
-		result, err = s.engine.RefreshAll(ctx, s.options)
-	} else {
-		if json.Unmarshal(params.Files, &names) != nil || names == nil {
-			return FilesDiagnosticsResult{}, invalidParams(`files must be an array of names or "all"`)
-		}
-		for _, name := range names {
-			if strings.TrimSpace(name) == "" {
-				return FilesDiagnosticsResult{}, invalidParams("each file is required")
-			}
-		}
-		result, err = s.engine.RefreshFiles(ctx, s.options, slices.Clone(names))
-	}
+	result, err := s.engine.RefreshAll(ctx)
 	if err != nil {
-		return FilesDiagnosticsResult{}, err
+		return WorkspaceResult{}, err
 	}
-	if len(result.Diagnostics) != len(result.Files) || len(result.SourceDigests) != len(result.Files) || (!all && !slices.Equal(names, result.Files)) {
-		return FilesDiagnosticsResult{}, fmt.Errorf("analyzer returned inconsistent file groups for diagnostics/files")
-	}
-	seen := make(map[string]bool)
-	files := make([]FileDiagnostics, len(result.Files))
-	for i, name := range result.Files {
-		if all {
-			if strings.TrimSpace(name) == "" || seen[name] {
-				return FilesDiagnosticsResult{}, fmt.Errorf("analyzer returned invalid file name %q for all files", name)
-			}
-			seen[name] = true
-		}
-		items := result.Diagnostics[i]
-		if items == nil {
-			items = []diagnostics.Diagnostic{}
-		}
-		files[i] = FileDiagnostics{File: name, SourceDigest: result.SourceDigests[i], Diagnostics: items}
+	files := make([]FileFindings, len(result.Files))
+	for i, group := range result.Files {
+		files[i] = FileFindings{File: group.File, SourceDigest: group.SourceDigest, Findings: findings(group.Diagnostics)}
 	}
 	s.logWarnings(result.Warnings)
-	return FilesDiagnosticsResult{SnapshotVersion: result.SnapshotVersion, RulesLoaded: result.RulesLoaded,
-		Files: files, Problems: problemStrings(result.WorkspaceProblems)}, nil
+	return WorkspaceResult{Problems: problemStrings(result.WorkspaceProblems), PhysicalRoot: result.PhysicalRoot, Files: files}, nil
+}
+
+func (s *Server) handleDocument(ctx context.Context, rawParams json.RawMessage) (DocumentResult, error) {
+	if !s.initialized {
+		return DocumentResult{}, fmt.Errorf("server not initialized")
+	}
+	var params struct {
+		File string `json:"file"`
+	}
+	if err := decodeParams(rawParams, &params); err != nil {
+		return DocumentResult{}, err
+	}
+	if strings.TrimSpace(params.File) == "" {
+		return DocumentResult{}, invalidParams("file is required")
+	}
+	result, err := s.engine.RefreshFile(ctx, params.File)
+	if err != nil {
+		return DocumentResult{}, err
+	}
+	document := DocumentResult{Problems: problemStrings(result.WorkspaceProblems), PhysicalRoot: result.PhysicalRoot, Findings: []Finding{}}
+	if len(result.Files) > 0 {
+		document.SourceDigest, document.Findings = result.Files[0].SourceDigest, findings(result.Files[0].Diagnostics)
+	}
+	s.logWarnings(result.Warnings)
+	return document, nil
+}
+
+func findings(items []diagnostics.Diagnostic) []Finding {
+	out := make([]Finding, 0, len(items))
+	for _, item := range items {
+		finding := Finding{RuleID: item.RuleID, AssertionID: item.AssertionID, Severity: string(item.Severity), Message: item.Message}
+		if item.DiagnosticKind == diagnostics.KindRuleExecutionError {
+			finding.Severity = "error"
+		}
+		if location := item.SourceLocation; location != nil {
+			finding.Range = &[4]int{location.StartLine, location.StartColumn, location.EndLine, location.EndColumn}
+		}
+		out = append(out, finding)
+	}
+	return out
 }
 
 func problemStrings(items []diagnostics.Diagnostic) []string {

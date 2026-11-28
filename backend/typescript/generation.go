@@ -57,7 +57,7 @@ func compilerObservations(inputs []lintaiapi.CompilerObservation) (observe.Set, 
 	for _, input := range inputs {
 		record := observe.Record{Kind: observe.Kind(input.Kind), Path: filepath.Clean(input.Path), Op: observe.Operation(input.Op), Value: observe.Value(input.Value), Entries: input.Entries}
 		if input.Stamp != nil {
-			record.Stamp = &observe.Stamp{Size: fmt.Sprint(input.Stamp.Size), MtimeNs: fmt.Sprint(input.Stamp.MtimeNs), ObservedAtNs: fmt.Sprint(input.Stamp.ObservedAtNs)}
+			record.Stamp = &observe.Stamp{Size: input.Stamp.Size, MtimeNs: input.Stamp.MtimeNs, ObservedAtNs: input.Stamp.ObservedAtNs}
 		}
 		records = append(records, record)
 	}
@@ -71,7 +71,6 @@ func (b *Backend) finishGeneration(generation *producerGeneration, plan *workspa
 		return fmt.Errorf("compiler observations: %w", err)
 	}
 	generation.observations = observe.Union(compilerSet, plan.Observations)
-	generation.aliases = plan.ExactAliases
 	requestedRoot, err := filepath.Abs(workspaceRoot)
 	if err != nil {
 		return err

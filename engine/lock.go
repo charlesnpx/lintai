@@ -26,13 +26,13 @@ const DefaultRulesLockFile = "lintai-rules.lock.json"
 const RulesLockFormat = "lintai.rules-lock/5"
 
 type RulesLock struct {
-	PackDigest     string
-	PolicyDigest   string
-	Suppressions   suppressions.File
+	PackDigest   string
+	PolicyDigest string
+	Suppressions suppressions.File
+	// target and targetSnapshot are the lock file read by a locked check,
+	// which guards that check's suppression write.
 	target         string
 	targetSnapshot atomicfile.Snapshot
-	source         string
-	sourceSnapshot atomicfile.Snapshot
 	observations   observe.Set
 }
 type lockJSON struct {
@@ -158,15 +158,6 @@ func typeScriptPolicyConfig(root string, value any) (any, error) {
 			return filepath.ToSlash(filepath.Clean(path)), nil
 		}
 		relative, err := filepath.Rel(root, path)
-		if err == nil && filepath.IsLocal(relative) {
-			return filepath.ToSlash(relative), nil
-		}
-		// Exact source selection also accepts the resolved spelling of a symlinked root.
-		if resolved, e := filepath.EvalSymlinks(root); e == nil {
-			if r, e := filepath.Rel(resolved, path); e == nil && filepath.IsLocal(r) {
-				return filepath.ToSlash(r), nil
-			}
-		}
 		if err != nil {
 			return "", err
 		}
@@ -195,7 +186,7 @@ func typeScriptPolicyConfig(root string, value any) (any, error) {
 }
 
 // policyDigest hashes effective Go policy before calling any executable entry.
-func policyDigest(options Options, catalog producerCatalog) (string, error) {
+func policyDigest(options Config, catalog producerCatalog) (string, error) {
 	policies := map[string]any{}
 	for id, policy := range options.Rule {
 		if policy.Severity != "error" || len(policy.Options) != 0 {
@@ -218,7 +209,7 @@ func policyDigest(options Options, catalog producerCatalog) (string, error) {
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(raw)), nil
 }
 
-func (lock RulesLock) verify(options Options, pack string, catalog producerCatalog) error {
+func (lock RulesLock) verify(options Config, pack string, catalog producerCatalog) error {
 	if pack != lock.PackDigest {
 		return fmt.Errorf("rule pack digest changed (approved %s, found %s); review and run lintai lock", lock.PackDigest, pack)
 	}
@@ -232,20 +223,38 @@ func (lock RulesLock) verify(options Options, pack string, catalog producerCatal
 	return nil
 }
 
-// BuildRulesLock inspects the published pack and the same effective policy used by Check.
-func (e *Session) BuildRulesLock(ctx context.Context, options Options) (RulesLock, error) {
+// ApproveRules inspects the published pack and the effective policy used by
+// Check and writes the rules lock to target in one guarded replacement. An
+// empty target selects the default lock file, and a relative target is under
+// the workspace root. It refuses a target that names the rule pack or the
+// suppressions file, or an existing file that is not a rules lock, and writes
+// nothing when the target or the suppressions file changes before the write.
+// The target is bound to its physical path before it is read, so a link in
+// that path that moves later does not move the write.
+func (e *Session) ApproveRules(ctx context.Context, target string) (RulesLock, error) {
 	ctx, finish, err := e.beginCheck(ctx)
 	if err != nil {
 		return RulesLock{}, err
 	}
 	defer finish()
-	options, _, err = effectiveOptions(options)
+	options := e.config
+	if target == "" {
+		target = DefaultRulesLockFile
+	}
+	target = physicalPath(ResolveRulesLockPath(options.WorkspaceRoot, target))
+	state, err := loadSuppressions(options, SuppressionUpdate{})
 	if err != nil {
 		return RulesLock{}, err
 	}
-	target := options.RulesLock
-	if target == "" {
-		target = ResolveRulesLockPath(options.WorkspaceRoot, DefaultRulesLockFile)
+	if err := rejectDanglingControlFile(state.path, "suppressions file"); err != nil {
+		return RulesLock{}, err
+	}
+	rulePackPath := filepath.Join(options.WorkspaceRoot, rulepack.Path)
+	if err := rejectDanglingControlFile(rulePackPath, "rule pack"); err != nil {
+		return RulesLock{}, err
+	}
+	if sameDestination(target, state.path) || sameDestination(target, rulePackPath) {
+		return RulesLock{}, fmt.Errorf("lock path conflicts with rule pack or suppressions")
 	}
 	targetState, err := atomicfile.Read(target)
 	if err != nil {
@@ -254,15 +263,7 @@ func (e *Session) BuildRulesLock(ctx context.Context, options Options) (RulesLoc
 	if targetState.Exists && !isRulesLockDocument(targetState.Data) {
 		return RulesLock{}, fmt.Errorf("%s exists and is not a lintai rules lock; refusing to overwrite it", target)
 	}
-	state, err := loadSuppressions(options)
-	if err != nil {
-		return RulesLock{}, err
-	}
-	if target == state.path || target == filepath.Join(options.WorkspaceRoot, rulepack.Path) {
-		return RulesLock{}, fmt.Errorf("lock path conflicts with rule pack or suppressions")
-	}
-	producers := e.catalog
-	digest, err := policyDigest(options, producers)
+	digest, err := policyDigest(options, e.catalog)
 	if err != nil {
 		return RulesLock{}, err
 	}
@@ -283,10 +284,62 @@ func (e *Session) BuildRulesLock(ctx context.Context, options Options) (RulesLoc
 		}
 		ids[entry.metadata.ID] = struct{}{}
 	}
-	if unknown := unknownPolicyRules(options, ids, "", nil); len(unknown) > 0 {
+	if unknown := unknownPolicyRules(options, ids); len(unknown) > 0 {
 		return RulesLock{}, fmt.Errorf("%s", unknown[0].Message)
 	}
-	return RulesLock{PackDigest: catalog.digest, PolicyDigest: digest, Suppressions: state.file, target: target, targetSnapshot: targetState, source: state.path, sourceSnapshot: state.snapshot}, ctx.Err()
+	lock := RulesLock{PackDigest: catalog.digest, PolicyDigest: digest, Suppressions: state.file}
+	data, err := encodeRulesLock(target, lock)
+	if err != nil {
+		return RulesLock{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return RulesLock{}, err
+	}
+	if e.hooks.beforeWrite != nil {
+		e.hooks.beforeWrite()
+	}
+	if err := atomicfile.Write(ctx, target, targetState, data, "rules_lock_changed", state.path, state.snapshot, "suppression_changed"); err != nil {
+		return RulesLock{}, err
+	}
+	return lock, nil
+}
+
+// sameDestination reports whether two paths name one file: through linked
+// directories, including before the file exists, or through a link to an
+// existing file.
+func sameDestination(a, b string) bool {
+	if physicalPath(a) == physicalPath(b) {
+		return true
+	}
+	left, leftErr := os.Stat(a)
+	right, rightErr := os.Stat(b)
+	return leftErr == nil && rightErr == nil && os.SameFile(left, right)
+}
+
+func rejectDanglingControlFile(path, name string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("%s %s is a dangling symlink", name, path)
+	}
+	return nil
+}
+
+// physicalPath resolves every link in path. When path does not resolve, it
+// resolves the nearest directory that does and keeps the remaining names. A
+// link at the unresolved part of the path is kept as a name.
+func physicalPath(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	dir := filepath.Dir(path)
+	if dir == path {
+		return path
+	}
+	return filepath.Join(physicalPath(dir), filepath.Base(path))
 }
 
 // isRulesLockDocument accepts any branded lintai rules-lock format, including
@@ -301,42 +354,51 @@ func isRulesLockDocument(data []byte) bool {
 	return strings.HasPrefix(header.Format, "lintai.rules-lock/")
 }
 
-func WriteRulesLock(ctx context.Context, path string, lock RulesLock) error {
-	if lock.target != "" && filepath.Clean(lock.target) != filepath.Clean(path) {
-		return fmt.Errorf("rules lock target changed")
-	}
+func encodeRulesLock(path string, lock RulesLock) ([]byte, error) {
 	approved := lock.Suppressions
 	if approved == nil {
 		approved = suppressions.File{}
 	}
 	canonicalApproved, err := suppressions.Encode(approved)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	approved, err = suppressions.Parse(path, canonicalApproved)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	allowances, err := json.Marshal(approved)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data, err := json.MarshalIndent(lockJSON{RulesLockFormat, rulepack.ABI, lock.PackDigest, lock.PolicyDigest, allowances}, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data = append(data, '\n')
 	if _, err := parseRulesLock(path, data); err != nil {
-		return err
+		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return atomicfile.Write(ctx, path, lock.targetSnapshot, data, "rules_lock_changed", lock.source, lock.sourceSnapshot, "suppression_changed")
+	return data, nil
 }
+
 func ResolveRulesLockPath(root, path string) string {
 	if filepath.IsAbs(path) {
 		return path
 	}
 	return filepath.Join(root, path)
+}
+
+// RebasePath moves an absolute path under the workspace path root onto the
+// physical directory of that workspace, so every path of a session names one
+// workspace. Other paths are returned unchanged.
+func RebasePath(root, physical, path string) string {
+	absolute, err := filepath.Abs(root)
+	if err != nil || !filepath.IsAbs(path) {
+		return path
+	}
+	if relative, err := filepath.Rel(absolute, path); err == nil && filepath.IsLocal(relative) {
+		return filepath.Join(physical, relative)
+	}
+	return path
 }

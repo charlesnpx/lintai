@@ -99,16 +99,17 @@ func runBuildRules(ctx context.Context, args []string) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected build-rules arguments: %v", flags.Args())
 	}
-	config, err := workspace.LoadWorkspaceConfig(filepath.Join(*root, "lintai.toml"), false)
+	physical := physicalRoot(*root)
+	config, err := workspace.LoadWorkspaceConfig(filepath.Join(physical, "lintai.toml"), false)
 	if err != nil {
 		return err
 	}
-	return rulepack.Build(ctx, *root, config.Entries)
+	return rulepack.Build(ctx, physical, config.Entries)
 }
 
 // The CLI constructs these producers for this session. Release them if
 // validation fails before Open can take ownership.
-func openSession(options engine.Options, producers ...backend.Producer) (*engine.Session, error) {
+func openSession(options engine.Config, producers ...backend.Producer) (*engine.Session, error) {
 	session, err := engine.Open(options, producers...)
 	if err != nil {
 		for _, producer := range producers {
@@ -126,11 +127,7 @@ func runSchema(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	absoluteWorkspace, err := filepath.Abs(*workspaceRoot)
-	if err != nil {
-		return err
-	}
-	settings, err := loadTypeScriptSettings(absoluteWorkspace, *configPath, "", false, "", false, nil, nil)
+	settings, _, physical, err := captureTypeScriptSettings(*workspaceRoot, *configPath, "", false, "", false, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -138,7 +135,7 @@ func runSchema(ctx context.Context, args []string, stdout io.Writer) error {
 	for _, item := range settings {
 		producers = append(producers, newBackend(item))
 	}
-	session, err := openSession(engine.Options{RepoRoot: absoluteWorkspace, WorkspaceRoot: absoluteWorkspace}, producers...)
+	session, err := openSession(engine.Config{WorkspaceRoot: physical}, producers...)
 	if err != nil {
 		return err
 	}
@@ -178,11 +175,7 @@ func runFacts(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	absoluteWorkspace, err := filepath.Abs(*workspaceRoot)
-	if err != nil {
-		return err
-	}
-	settings, err := loadTypeScriptSettings(absoluteWorkspace, *configPath, *files, flagProvided(flags, "files"), *sourceLinks, flagProvided(flags, "source-links"), excludes, sources)
+	settings, _, physical, err := captureTypeScriptSettings(*workspaceRoot, *configPath, *files, flagProvided(flags, "files"), *sourceLinks, flagProvided(flags, "source-links"), excludes, sources)
 	if err != nil {
 		return err
 	}
@@ -190,7 +183,7 @@ func runFacts(ctx context.Context, args []string, stdout io.Writer) error {
 	for _, item := range settings {
 		producers = append(producers, newBackend(item))
 	}
-	session, err := openSession(engine.Options{RepoRoot: absoluteWorkspace, WorkspaceRoot: absoluteWorkspace}, producers...)
+	session, err := openSession(engine.Config{WorkspaceRoot: physical}, producers...)
 	if err != nil {
 		return err
 	}
@@ -214,14 +207,30 @@ func runServe(ctx context.Context) error {
 }
 
 // serveSession owns the configuration receipt and the producers made from it.
+// physical is the workspace directory the session and its configuration use.
 type serveSession struct {
 	params   server.InitializeParams
 	config   workspace.WorkspaceConfig
+	physical string
 	receipt  bool
 	settings []typescript.Options
 	session  *engine.Session
 }
 
+// physicalRoot resolves the workspace path to the directory a session uses.
+func physicalRoot(root string) string {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return root
+	}
+	if physical, err := workspace.PhysicalPath(absolute); err == nil {
+		return physical
+	}
+	return absolute
+}
+
+// configure follows a moved workspace link or changed configuration by
+// replacing the session. A session never changes its workspace.
 func (s *serveSession) configure(ctx context.Context) (err error) {
 	defer func() {
 		if err != nil {
@@ -231,7 +240,8 @@ func (s *serveSession) configure(ctx context.Context) (err error) {
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if s.receipt && s.session != nil && len(s.config.Observations.Records()) != 0 {
+	physical := physicalRoot(s.params.WorkspaceRoot)
+	if s.receipt && s.session != nil && physical == s.physical && len(s.config.Observations.Records()) != 0 {
 		var changed *observe.Record
 		changed, err = s.config.Observations.Changed(ctx, observe.Quick)
 		if err != nil {
@@ -243,14 +253,14 @@ func (s *serveSession) configure(ctx context.Context) (err error) {
 	}
 	var config workspace.WorkspaceConfig
 	var settings []typescript.Options
-	settings, config, err = captureTypeScriptSettings(s.params.WorkspaceRoot, "", "", false, "", false, nil, nil)
+	settings, config, physical, err = captureTypeScriptSettings(s.params.WorkspaceRoot, "", "", false, "", false, nil, nil)
 	if err != nil {
 		return fmt.Errorf("load workspace configuration: %w", err)
 	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if s.session == nil || !reflect.DeepEqual(settings, s.settings) {
+	if s.session == nil || physical != s.physical || !reflect.DeepEqual(settings, s.settings) || !reflect.DeepEqual(config.Rule, s.config.Rule) {
 		if s.session != nil {
 			err = s.session.Close()
 			s.session = nil
@@ -262,39 +272,37 @@ func (s *serveSession) configure(ctx context.Context) (err error) {
 		for _, item := range settings {
 			producers = append(producers, newBackend(item))
 		}
-		s.session, err = openSession(engine.Options{}, producers...)
+		root := s.params.WorkspaceRoot
+		s.session, err = openSession(engine.Config{
+			WorkspaceRoot: physical, Rule: config.Rule, FactLimit: s.params.FactLimit, RuleWorkers: s.params.RuleWorkers,
+			RulesLock: engine.RebasePath(root, physical, s.params.RulesLock), SuppressionsLocation: engine.RebasePath(root, physical, s.params.SuppressionsLocation),
+		}, producers...)
 		if err != nil {
 			return err
 		}
 		s.settings = settings
 	}
-	s.config, s.receipt = config, true
+	s.config, s.physical, s.receipt = config, physical, true
 	return nil
 }
 
-func (s *serveSession) RefreshFiles(ctx context.Context, options engine.Options, files []string) (engine.FilesResult, error) {
+func (s *serveSession) RefreshFile(ctx context.Context, file string) (engine.FilesResult, error) {
 	if err := s.configure(ctx); err != nil {
 		return engine.FilesResult{}, err
 	}
-	if err := ctx.Err(); err != nil {
-		_ = s.Close()
-		return engine.FilesResult{}, err
-	}
-	options.Rule = s.config.Rule
-	return s.session.RefreshFiles(ctx, options, files)
+	return s.session.RefreshFile(ctx, file)
 }
 
-func (s *serveSession) RefreshAll(ctx context.Context, options engine.Options) (engine.FilesResult, error) {
+func (s *serveSession) RefreshAll(ctx context.Context) (engine.FilesResult, error) {
 	if err := s.configure(ctx); err != nil {
 		return engine.FilesResult{}, err
 	}
-	options.Rule = s.config.Rule
-	return s.session.RefreshAll(ctx, options)
+	return s.session.RefreshAll(ctx)
 }
 
 func (s *serveSession) Close() error {
 	s.receipt = false
-	s.config = workspace.WorkspaceConfig{}
+	s.config, s.physical = workspace.WorkspaceConfig{}, ""
 	s.settings = nil
 	if s.session != nil {
 		session := s.session
@@ -314,23 +322,23 @@ func flagProvided(flags *flag.FlagSet, name string) bool {
 	return provided
 }
 
-func loadTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride string, filesSet bool, sourceLinksOverride string, sourceLinksSet bool, invocationExcludes, invocationSources []string) ([]typescript.Options, error) {
-	settings, _, err := captureTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride, filesSet, sourceLinksOverride, sourceLinksSet, invocationExcludes, invocationSources)
-	return settings, err
-}
-
-func captureTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride string, filesSet bool, sourceLinksOverride string, sourceLinksSet bool, invocationExcludes, invocationSources []string) ([]typescript.Options, workspace.WorkspaceConfig, error) {
+// captureTypeScriptSettings resolves the workspace path to its physical
+// directory before it reads the configuration, reads every input through that
+// directory and returns it. Absolute paths under the given path are rebased
+// onto the physical directory.
+func captureTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride string, filesSet bool, sourceLinksOverride string, sourceLinksSet bool, invocationExcludes, invocationSources []string) ([]typescript.Options, workspace.WorkspaceConfig, string, error) {
 	invocationDir, err := os.Getwd()
 	if err != nil {
-		return nil, workspace.WorkspaceConfig{}, err
+		return nil, workspace.WorkspaceConfig{}, "", err
 	}
-	configPath, optional, err := workspace.ResolveConfigPath(workspaceRoot, invocationDir, explicitConfig)
+	physical := physicalRoot(workspaceRoot)
+	configPath, optional, err := workspace.ResolveConfigPath(physical, invocationDir, explicitConfig)
 	if err != nil {
-		return nil, workspace.WorkspaceConfig{}, err
+		return nil, workspace.WorkspaceConfig{}, "", err
 	}
-	config, err := workspace.LoadWorkspaceConfig(configPath, optional)
+	config, err := workspace.LoadWorkspaceConfig(engine.RebasePath(workspaceRoot, physical, configPath), optional)
 	if err != nil {
-		return nil, workspace.WorkspaceConfig{}, err
+		return nil, workspace.WorkspaceConfig{}, "", err
 	}
 	producers := config.Producers
 	if len(producers) == 0 {
@@ -342,7 +350,7 @@ func captureTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride stri
 	}
 	sort.Strings(namespaces)
 	if len(namespaces) > 1 && (filesSet || sourceLinksSet) {
-		return nil, workspace.WorkspaceConfig{}, fmt.Errorf("TypeScript command-line scope flags are ambiguous with multiple TypeScript producers; configure them in lintai.toml")
+		return nil, workspace.WorkspaceConfig{}, "", fmt.Errorf("TypeScript command-line scope flags are ambiguous with multiple TypeScript producers; configure them in lintai.toml")
 	}
 	settings := make([]typescript.Options, 0, len(namespaces))
 	for _, namespace := range namespaces {
@@ -352,7 +360,7 @@ func captureTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride stri
 			implementation = "lintai.typescript"
 		}
 		if implementation != "lintai.typescript" {
-			return nil, workspace.WorkspaceConfig{}, fmt.Errorf("unknown implementation %q for producer %q", implementation, namespace)
+			return nil, workspace.WorkspaceConfig{}, "", fmt.Errorf("unknown implementation %q for producer %q", implementation, namespace)
 		}
 		fileMode := producerConfig.Files
 		if fileMode == "" {
@@ -363,20 +371,41 @@ func captureTypeScriptSettings(workspaceRoot, explicitConfig, filesOverride stri
 		}
 		scope, err := typescript.ParseFileScope(fileMode)
 		if err != nil {
-			return nil, workspace.WorkspaceConfig{}, err
+			return nil, workspace.WorkspaceConfig{}, "", err
 		}
 		sourceLinks := producerConfig.SourceLinks
 		if sourceLinksSet {
 			sourceLinks = sourceLinksOverride
 		}
 		sources := append(slices.Clone(config.Sources), invocationSources...)
+		for i, source := range sources {
+			sources[i] = engine.RebasePath(workspaceRoot, physical, source)
+		}
 		settings = append(settings, typescript.Options{
 			Namespace: namespace, WorkspaceExcludes: config.Exclude,
 			Includes: config.Include, Sources: sources,
-			Excludes: invocationExcludes, Files: scope, SourceLinks: sourceLinks,
+			Excludes: invocationExcludes, Files: scope, SourceLinks: engine.RebasePath(workspaceRoot, physical, sourceLinks),
 		})
 	}
-	return settings, config, nil
+	return settings, config, physical, nil
+}
+
+type producerScope struct {
+	Producer string                      `json:"producer"`
+	Files    string                      `json:"files"`
+	Scope    typescript.ScopeExplanation `json:"scope"`
+}
+
+func explainScopes(ctx context.Context, physical string, settings []typescript.Options) ([]producerScope, error) {
+	reports := make([]producerScope, 0, len(settings))
+	for _, item := range settings {
+		report, err := typescript.ExplainScope(ctx, physical, item)
+		if err != nil {
+			return nil, err
+		}
+		reports = append(reports, producerScope{Producer: item.Namespace, Files: string(item.Files), Scope: report})
+	}
+	return reports, nil
 }
 
 func runScope(ctx context.Context, args []string, stdout io.Writer) error {
@@ -398,26 +427,13 @@ func runScope(ctx context.Context, args []string, stdout io.Writer) error {
 	if !*explain {
 		return fmt.Errorf("lintai scope requires --explain")
 	}
-	root, err := filepath.Abs(*workspaceRoot)
+	settings, _, physical, err := captureTypeScriptSettings(*workspaceRoot, *configPath, *files, flagProvided(flags, "files"), *sourceLinks, flagProvided(flags, "source-links"), excludes, sources)
 	if err != nil {
 		return err
 	}
-	settings, err := loadTypeScriptSettings(root, *configPath, *files, flagProvided(flags, "files"), *sourceLinks, flagProvided(flags, "source-links"), excludes, sources)
+	reports, err := explainScopes(ctx, physical, settings)
 	if err != nil {
 		return err
-	}
-	type producerScope struct {
-		Producer string                      `json:"producer"`
-		Files    string                      `json:"files"`
-		Scope    typescript.ScopeExplanation `json:"scope"`
-	}
-	reports := make([]producerScope, 0, len(settings))
-	for _, item := range settings {
-		report, err := typescript.ExplainScope(ctx, root, item)
-		if err != nil {
-			return err
-		}
-		reports = append(reports, producerScope{Producer: item.Namespace, Files: string(item.Files), Scope: report})
 	}
 	if *jsonOutput {
 		encoder := json.NewEncoder(stdout)
@@ -465,16 +481,15 @@ func runScope(ctx context.Context, args []string, stdout io.Writer) error {
 }
 
 type projectFlags struct {
-	flags                                                *flag.FlagSet
-	repo, root, config, files, sourceLinks, suppressions *string
-	factLimit                                            *int
-	excludes, sources                                    stringList
+	flags                                          *flag.FlagSet
+	root, config, files, sourceLinks, suppressions *string
+	factLimit                                      *int
+	excludes, sources                              stringList
 }
 
 func newProjectFlags(flags *flag.FlagSet) *projectFlags {
 	p := &projectFlags{flags: flags}
 	p.root = flags.String("workspace-root", ".", "workspace to analyze")
-	p.repo = flags.String("repo-root", "", "producer repository root (defaults to workspace)")
 	p.config = flags.String("config", "", "lintai.toml file relative to invocation directory")
 	p.files = flags.String("files", "", "source selection mode: tsconfig or walk")
 	p.sourceLinks = flags.String("source-links", "", "source-entry associations relative to workspace")
@@ -484,23 +499,20 @@ func newProjectFlags(flags *flag.FlagSet) *projectFlags {
 	flags.Var(&p.sources, "source", "select an exact workspace source file (repeatable)")
 	return p
 }
-func (p *projectFlags) open() (*engine.Session, engine.Options, error) {
+
+// open binds every parsed setting into the session configuration. The caller
+// supplies execution settings such as workers, explanations and lock selection.
+func (p *projectFlags) open(options engine.Config) (*engine.Session, engine.Config, error) {
 	if *p.factLimit <= 0 {
-		return nil, engine.Options{}, fmt.Errorf("--fact-limit must be positive")
+		return nil, engine.Config{}, fmt.Errorf("--fact-limit must be positive")
 	}
-	root, err := filepath.Abs(*p.root)
+	settings, config, physical, err := captureTypeScriptSettings(*p.root, *p.config, *p.files, flagProvided(p.flags, "files"), *p.sourceLinks, flagProvided(p.flags, "source-links"), p.excludes, p.sources)
 	if err != nil {
-		return nil, engine.Options{}, err
+		return nil, engine.Config{}, err
 	}
-	settings, config, err := captureTypeScriptSettings(root, *p.config, *p.files, flagProvided(p.flags, "files"), *p.sourceLinks, flagProvided(p.flags, "source-links"), p.excludes, p.sources)
-	if err != nil {
-		return nil, engine.Options{}, err
-	}
-	repo := *p.repo
-	if repo == "" {
-		repo = root
-	}
-	options := engine.Options{RepoRoot: repo, WorkspaceRoot: root, Rule: config.Rule, FactLimit: *p.factLimit, SuppressionsLocation: *p.suppressions}
+	options.WorkspaceRoot, options.Rule, options.FactLimit = physical, config.Rule, *p.factLimit
+	options.SuppressionsLocation = engine.RebasePath(*p.root, physical, *p.suppressions)
+	options.RulesLock = engine.RebasePath(*p.root, physical, options.RulesLock)
 	producers := make([]backend.Producer, 0, len(settings))
 	for _, setting := range settings {
 		producers = append(producers, newBackend(setting))
@@ -529,14 +541,18 @@ func runOnce(ctx context.Context, args []string, stdout io.Writer) error {
 	if *explain && !*jsonOutput {
 		return fmt.Errorf("--explain requires --json")
 	}
-	runner, options, err := project.open()
+	runner, _, err := project.open(engine.Config{RuleWorkers: *ruleWorkers, Explain: *explain, RulesLock: *rulesLock})
 	if err != nil {
 		return err
 	}
 	defer runner.Close()
-	options.RuleWorkers, options.Explain, options.RulesLock = *ruleWorkers, *explain, *rulesLock
-	options.SuppressAll, options.SuppressRules, options.PruneSuppressions = *suppressAll, suppressRules, *pruneSuppressions
-	result, err := runner.Check(ctx, options)
+	update := engine.SuppressionUpdate{All: *suppressAll, Rules: suppressRules, Prune: *pruneSuppressions}
+	var result engine.Result
+	if update.All || len(update.Rules) > 0 || update.Prune {
+		result, err = runner.UpdateSuppressions(ctx, update)
+	} else {
+		result, err = runner.Check(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -616,20 +632,17 @@ func runLock(ctx context.Context, args []string, stdout io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
-	session, options, err := project.open()
+	session, options, err := project.open(engine.Config{})
 	if err != nil {
 		return err
 	}
 	defer session.Close()
-	options.RulesLock = *path
-	lock, err := session.BuildRulesLock(ctx, options)
+	lock, err := session.ApproveRules(ctx, engine.RebasePath(*project.root, options.WorkspaceRoot, *path))
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(stdout, "pack %s\npolicy %s\n", lock.PackDigest, lock.PolicyDigest); err != nil {
-		return err
-	}
-	return engine.WriteRulesLock(ctx, engine.ResolveRulesLockPath(options.WorkspaceRoot, *path), lock)
+	_, err = fmt.Fprintf(stdout, "pack %s\npolicy %s\n", lock.PackDigest, lock.PolicyDigest)
+	return err
 }
 
 // newBackend returns the TypeScript backend that reports adjusted tsconfigs

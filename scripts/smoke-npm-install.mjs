@@ -185,15 +185,15 @@ assert.match(findings[0].message, /\[arch.actions-return-action-result\/violatio
 assert.match(findings[1].message, /\[arch.no-async\/violation\] example/);
 const requests = await readRequests();
 assert.deepEqual(
-	requests.filter((row) => row.method === "diagnostics/files").map((row) => row.files),
-	["all"],
+	requests.filter((row) => row.method.startsWith("diagnostics/")).map((row) => row.method),
+	["diagnostics/workspace"],
 );
 await assertStopped(requests[0].pid);
 await encodedSources(repoDir, (file) => lint(file).map((item) => item.message), "eslint");
 await largeResult(repoDir, (file) => lint(file).map((item) => item.message));
 
 // A file-local disable on one file must not hide an invocation-wide failure,
-// and an exact source reached through a symlink keeps its configured spelling.
+// and a host visit through a source-directory link finds the linked document.
 {
 	const configPath = path.join(repoDir, "lintai.toml");
 	const eslintPath = path.join(repoDir, "eslint.config.mjs");
@@ -259,93 +259,142 @@ await largeResult(repoDir, (file) => lint(file).map((item) => item.message));
 	}
 }
 
-const { createLintaiPlugin } = await load("@lintai/eslint-plugin");
+const { createCapturedLintaiPlugin, createLintaiPlugin, createLintaiSession } =
+	await load("@lintai/eslint-plugin");
 const { Linter } = await load("eslint");
-const plugin = createLintaiPlugin({ workspaceRoot: repoDir });
 const linter = new Linter({ cwd: repoDir });
 const filename = "src/example.ts";
 const sourcePath = path.join(repoDir, filename);
 const original = await fs.readFile(sourcePath, "utf8");
 const edited = original.replace("async function", "function");
-const verify = (text, name = filename) =>
-	linter.verify(text, [{ files: ["**/*.ts"], ...plugin.configs.all }], { filename: name });
+const display = (capture, text, name = filename, cwdLinter = linter) =>
+	cwdLinter.verify(
+		text,
+		[{ files: ["**/*.ts"], ...createCapturedLintaiPlugin(capture).configs.all }],
+		{ filename: name },
+	);
+const messages = (items) => items.map((item) => item.message).join("\n");
+const analyses = async () =>
+	(await readRequests()).filter((row) => row.method.startsWith("diagnostics/")).length;
 const config = path.join(repoDir, "lintai.toml");
 const configText = await fs.readFile(config, "utf8");
+const session = createLintaiSession({
+	workspaceRoot: repoDir,
+	binary: path.join(repoDir, "observe-serve.mjs"),
+});
 try {
 	await fs.writeFile(
 		path.join(repoDir, "lintai-rules/broken.ts"),
-		"throw new Error('batch problem');",
+		"throw new Error('capture problem');",
 	);
 	await fs.writeFile(
 		config,
 		configText.replace("entries = [", 'entries = ["lintai-rules/broken.ts", '),
 	);
 	build(repoDir);
-	await plugin.withFileBatch([filename, filename], async ({ problems }) => {
-		assert.match(problems.join(" "), /batch problem/);
-		await fs.writeFile(sourcePath, edited);
-		const mismatched = verify(edited);
-		assert.deepEqual(
-			mismatched.map((item) => item.ruleId),
-			["lintai/error", "lintai/error"],
-		);
-		assert.equal(mismatched.filter((item) => item.message.includes("batch problem")).length, 1);
-		assert.equal(mismatched.filter((item) => item.message.includes("Save the file")).length, 1);
-		assert.match(
-			verify(original)
-				.map((item) => item.message)
-				.join("\n"),
-			/\[arch.no-async\/violation\]/,
-		);
-		assert.throws(() => verify(original, "src/extra.ts"), /was not supplied/);
+	const failed = session.capture();
+	assert.match(failed.problems.join(" "), /capture problem/);
+	// The edited buffer no longer matches the captured digest: one problem and
+	// one save notice, and no stale range.
+	const mismatched = display(failed, edited);
+	assert.deepEqual(
+		mismatched.map((item) => item.ruleId),
+		["lintai/error", "lintai/error"],
+	);
+	assert.match(messages(mismatched), /Save the file/);
+	assert.match(messages(display(failed, original)), /\[arch.no-async\/violation\]/);
 
-		// A nested capture sees the saved edit. Reverting on disk during this
-		// callback leaves both the inner and outer snapshots intact.
-		await plugin.withFileBatch([filename], async () => {
-			await fs.writeFile(sourcePath, original);
-			assert.deepEqual(
-				verify(edited).map((item) => item.message),
-				problems,
-			);
-			assert.match(
-				verify(original)
-					.map((item) => item.message)
-					.join("\n"),
-				/Save the file/,
-			);
-		});
-		assert.match(
-			verify(original)
-				.map((item) => item.message)
-				.join("\n"),
-			/\[arch.no-async\/violation\]/,
-		);
-	});
-	await plugin.withFileBatch([], ({ problems }) => assert.match(problems[0], /batch problem/));
+	// A workspace that cannot be analyzed has its problem and no files.
+	await fs.writeFile(config, "[workspace\n");
+	const broken = session.capture();
+	assert.match(broken.problems.join(" "), /config/);
+	assert.deepEqual(broken.files, []);
+
 	await fs.writeFile(config, configText);
 	build(repoDir);
-	const gate = Promise.withResolvers();
-	const first = plugin.withFileBatch([filename], async () => {
-		await gate.promise;
-		const findings = verify(original);
-		assert.equal(findings.length, 1);
-		assert.match(findings[0].message, /\[arch.no-async\/violation\]/);
+	const before = session.capture();
+	assert.deepEqual(before.problems, []);
+	await fs.writeFile(sourcePath, edited);
+	const after = session.capture();
+	const requests = await analyses();
+	session.dispose();
+	// Both captures remain displayable after the edit and after disposal,
+	// without another request or a read of the edited file.
+	assert.match(messages(display(before, original)), /\[arch.no-async\/violation\]/);
+	assert.match(messages(display(before, edited)), /Save the file/);
+	assert.deepEqual(display(after, edited), []);
+	assert.equal(await analyses(), requests);
+	assert.throws(() => session.capture(), /disposed/);
+} finally {
+	session.dispose();
+	await fs.rm(path.join(repoDir, "lintai-rules/broken.ts"), { force: true });
+	await fs.writeFile(config, configText);
+	await fs.writeFile(sourcePath, original);
+	build(repoDir);
+}
+
+// A capture through current -> A keeps A's identity after current moves to a
+// copy B with identical bytes.
+{
+	const parent = await fs.mkdtemp(path.join(path.dirname(repoDir), "lintai-switch-"));
+	const copyA = path.join(parent, "a");
+	const copyB = path.join(parent, "b");
+	const current = path.join(parent, "current");
+	await fs.cp(repoDir, copyA, { recursive: true, verbatimSymlinks: true });
+	await fs.cp(repoDir, copyB, { recursive: true, verbatimSymlinks: true });
+	await fs.symlink(copyA, current);
+	const switched = createLintaiSession({
+		workspaceRoot: current,
+		binary: path.join(repoDir, "observe-serve.mjs"),
 	});
 	try {
-		await fs.writeFile(sourcePath, edited);
-		await plugin.withFileBatch([filename], async () => {
-			gate.resolve();
-			await first;
-			assert.deepEqual(verify(edited), []);
-		});
+		const capture = switched.capture();
+		await fs.rm(current);
+		await fs.symlink(copyB, current);
+		const requests = await analyses();
+		const outer = new Linter({ cwd: parent });
+		const atA = display(capture, original, path.join(copyA, filename), outer);
+		const atB = display(capture, original, path.join(copyB, filename), outer);
+		assert.match(messages(atA), /\[arch.no-async\/violation\]/);
+		assert.deepEqual(atB, []);
+		assert.equal(await analyses(), requests);
 	} finally {
-		gate.resolve();
-		await first;
+		switched.dispose();
+		await fs.rm(parent, { recursive: true, force: true });
 	}
-	assert.deepEqual(verify(edited), []);
-} finally {
-	plugin.dispose();
-	await fs.writeFile(sourcePath, original);
+}
+
+// On a case-insensitive volume, a workspace path typed in another letter case
+// names the same documents in a live visit and in a capture.
+{
+	const base = path.basename(repoDir);
+	const upper = base.toUpperCase();
+	const respelled = path.join(path.dirname(repoDir), upper === base ? base.toLowerCase() : upper);
+	const same = await Promise.all([fs.stat(repoDir), fs.stat(respelled).catch(() => undefined)]);
+	if (same[1]?.ino !== same[0].ino) {
+		console.log("skipping the letter-case check: the temporary volume is case-sensitive");
+	} else {
+		const options = { workspaceRoot: respelled, binary: path.join(repoDir, "observe-serve.mjs") };
+		const respelledLinter = new Linter({ cwd: respelled });
+		const respelledFile = path.join(respelled, filename);
+		const livePlugin = createLintaiPlugin(options);
+		const caseSession = createLintaiSession(options);
+		try {
+			const visited = respelledLinter.verify(
+				original,
+				[{ files: ["**/*.ts"], ...livePlugin.configs.all }],
+				{ filename: respelledFile },
+			);
+			assert.match(messages(visited), /\[arch.no-async\/violation\] example/);
+			const capture = caseSession.capture();
+			assert.deepEqual(capture.problems, []);
+			const captured = display(capture, original, respelledFile, respelledLinter);
+			assert.match(messages(captured), /\[arch.no-async\/violation\] example/);
+		} finally {
+			livePlugin.dispose();
+			caseSession.dispose();
+		}
+	}
 }
 
 // Lint one unchanged SourceCode object before and after an imported type
@@ -387,11 +436,12 @@ try {
 	assert.equal(verifyAction(await fs.readFile(actionPath, "utf8")).length, 1);
 	await fs.writeFile(imported, "export type ActionResult<T> = number;\n");
 	assert.equal(verifyAction(sameSource).length, 2);
-	const selectors = (await readRequests())
+	const documents = (await readRequests())
 		.slice(before)
-		.filter((row) => row.method === "diagnostics/files")
-		.map((row) => row.files);
-	assert.deepEqual(selectors, [["src/actions/save.ts"], ["src/actions/save.ts"]]);
+		.filter((row) => row.method.startsWith("diagnostics/"))
+		.map((row) => [row.method, row.file]);
+	const document = ["diagnostics/document", await fs.realpath(actionPath)];
+	assert.deepEqual(documents, [document, document]);
 } finally {
 	live.dispose();
 	await fs.writeFile(imported, typeSource);
@@ -415,10 +465,10 @@ try {
 	);
 	const requests = (await readRequests())
 		.slice(before)
-		.filter((row) => row.method === "diagnostics/files");
+		.filter((row) => row.method.startsWith("diagnostics/"));
 	assert.deepEqual(
-		requests.map((row) => row.files),
-		["all"],
+		requests.map((row) => row.method),
+		["diagnostics/workspace"],
 	);
 } finally {
 	invocation.dispose();

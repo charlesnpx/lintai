@@ -29,7 +29,6 @@ func TestFixtureRulesReportPlantedViolations(t *testing.T) {
 	}
 	args := []string{
 		"--json", "--explain",
-		"--repo-root", repoRoot,
 		"--workspace-root", testpack.Build(t, repoRoot, filepath.Join(repoRoot, "testdata/fixtures/workspace"), filepath.Join(repoRoot, "testdata/fixtures/rules/*.ts")),
 	}
 	first := runJSON(t, args)
@@ -212,7 +211,6 @@ func TestRelationExamples(t *testing.T) {
 			}
 			args := []string{
 				"--json", "--explain",
-				"--repo-root", repoRoot,
 				"--workspace-root", testpack.Build(t, repoRoot, filepath.Join(base, "workspace"), ruleGlob),
 			}
 			if family.sourceLinks != "" {
@@ -268,23 +266,23 @@ func TestServeSessionReplacesChangedProducerConfiguration(t *testing.T) {
 		}
 	}
 	setConfig("b.ts")
-	options := engine.Options{RepoRoot: repo, WorkspaceRoot: testpack.Build(t, repo, root, filepath.Join(repo, "testdata/fixtures/rules/layers.ts")), RuleWorkers: 2}
-	instance := &serveSession{params: server.InitializeParams{WorkspaceRoot: root}}
+	testpack.Build(t, repo, root, filepath.Join(repo, "testdata/fixtures/rules/layers.ts"))
+	instance := &serveSession{params: server.InitializeParams{WorkspaceRoot: root, RuleWorkers: 2}}
 	defer instance.Close()
-	first, err := instance.RefreshAll(context.Background(), options)
+	first, err := instance.RefreshAll(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(first.Files, "a.ts") || slices.Contains(first.Files, "b.ts") {
+	if !slices.Contains(names(first), "a.ts") || slices.Contains(names(first), "b.ts") {
 		t.Fatalf("initial scope: %v", first.Files)
 	}
 	previous := instance.session
 	setConfig("a.ts")
-	second, err := instance.RefreshAll(context.Background(), options)
+	second, err := instance.RefreshAll(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if instance.session == previous || slices.Contains(second.Files, "a.ts") || !slices.Contains(second.Files, "b.ts") {
+	if instance.session == previous || slices.Contains(names(second), "a.ts") || !slices.Contains(names(second), "b.ts") {
 		t.Fatalf("changed configuration retained old producer scope: %v", second.Files)
 	}
 	if _, err := previous.Current(); err == nil {
@@ -316,14 +314,14 @@ func TestExitCodes(t *testing.T) {
 		args []string
 		want int
 	}{
-		{"violations", []string{"--workspace-root", workspace, "--repo-root", repoRoot}, exitViolations},
-		{"parallel check", []string{"check", "--workspace-root", workspace, "--repo-root", repoRoot, "--rule-workers", "1", "--rule-workers", "2"}, exitViolations},
+		{"violations", []string{"--workspace-root", workspace}, exitViolations},
+		{"parallel check", []string{"check", "--workspace-root", workspace, "--rule-workers", "1", "--rule-workers", "2"}, exitViolations},
 		{"negative workers", []string{"--rule-workers", "-1"}, exitUsage},
 		{"noninteger workers", []string{"--rule-workers", "1.5"}, exitUsage},
-		{"clean", []string{"--workspace-root", workspace, "--repo-root", repoRoot, "--exclude", "src/pure/**"}, exitClean},
+		{"clean", []string{"--workspace-root", workspace, "--exclude", "src/pure/**"}, exitClean},
 		{"unknown flag", []string{"--no-such-flag"}, exitUsage},
-		{"bad file scope", []string{"--workspace-root", workspace, "--repo-root", repoRoot, "--files", "all"}, exitUsage},
-		{"obsolete rule glob flag", []string{"--workspace-root", workspace, "--repo-root", repoRoot, "--rules", "missing/*.ts"}, exitUsage},
+		{"bad file scope", []string{"--workspace-root", workspace, "--files", "all"}, exitUsage},
+		{"obsolete rule glob flag", []string{"--workspace-root", workspace, "--rules", "missing/*.ts"}, exitUsage},
 		{"unknown relation", []string{"facts", "--workspace-root", workspace, "--relation", "no_such_relation"}, exitUsage},
 	}
 	for _, item := range cases {
@@ -367,7 +365,7 @@ source_links = "links.json"
 	if err := os.WriteFile(filepath.Join(root, "lintai.toml"), []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	settings, err := loadTypeScriptSettings(root, "", "", false, "", false, []string{"cli/**"}, []string{"cli.d.ts"})
+	settings, _, _, err := captureTypeScriptSettings(root, "", "", false, "", false, []string{"cli/**"}, []string{"cli.d.ts"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +374,7 @@ source_links = "links.json"
 		!slices.Equal(settings[0].Excludes, []string{"cli/**"}) || !slices.Equal(settings[0].Sources, []string{"configured.d.ts", "cli.d.ts"}) {
 		t.Fatalf("configuration defaults or list appends were not applied: %+v", settings)
 	}
-	settings, err = loadTypeScriptSettings(root, "", "tsconfig", true, "", true, nil, nil)
+	settings, _, _, err = captureTypeScriptSettings(root, "", "tsconfig", true, "", true, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,10 +387,10 @@ implementation = "lintai.typescript"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadTypeScriptSettings(root, "", "walk", true, "", false, nil, nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+	if _, _, _, err := captureTypeScriptSettings(root, "", "walk", true, "", false, nil, nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("scalar TypeScript flags were accepted with multiple configured instances: %v", err)
 	}
-	if _, err := loadTypeScriptSettings(root, "", "", false, "", true, nil, nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+	if _, _, _, err := captureTypeScriptSettings(root, "", "", false, "", true, nil, nil); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("source-links flag was accepted with multiple configured instances: %v", err)
 	}
 	if err := os.Mkdir(filepath.Join(root, "cli"), 0o755); err != nil {
@@ -584,7 +582,7 @@ export default rule("t.expect-all").version(1).program(dl` + "`Decl a(M). a(M) :
 	}
 	var stdout bytes.Buffer
 	err = run(context.Background(), []string{
-		"--json", "--repo-root", repoRoot,
+		"--json",
 		"--workspace-root", testpack.Build(t, repoRoot, filepath.Join(repoRoot, "testdata/fixtures/workspace"), filepath.Join(rulesDir, "*.ts")),
 	}, &stdout)
 	if code := exitCode(err, io.Discard); code != exitRuleError {
@@ -734,7 +732,7 @@ export default rule("arch.dup-config").version(1).program(dl` + "`Decl v(M). v(M
 	}
 
 	stdout.Reset()
-	err = run(context.Background(), []string{"--json", "--repo-root", repoRoot, "--workspace-root", testpack.Build(t, repoRoot, workspace, "lintai-rules/alpha.ts", "lintai-rules/dup-*.ts", "lintai-rules/bad-id.ts")}, &stdout)
+	err = run(context.Background(), []string{"--json", "--workspace-root", testpack.Build(t, repoRoot, workspace, "lintai-rules/alpha.ts", "lintai-rules/dup-*.ts", "lintai-rules/bad-id.ts")}, &stdout)
 	if code := exitCode(err, io.Discard); code != exitRuleError {
 		t.Fatalf("exit code %d, want %d: %v", code, exitRuleError, err)
 	}
@@ -763,4 +761,12 @@ export default rule("arch.dup-config").version(1).program(dl` + "`Decl v(M). v(M
 func strconvQuote(value string) string {
 	encoded, _ := json.Marshal(value)
 	return string(encoded)
+}
+
+func names(result engine.FilesResult) []string {
+	files := make([]string, len(result.Files))
+	for i, group := range result.Files {
+		files[i] = group.File
+	}
+	return files
 }
